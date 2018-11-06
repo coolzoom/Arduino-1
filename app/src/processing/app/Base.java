@@ -41,6 +41,9 @@ import cc.arduino.view.SplashScreenHelper;
 
 import org.apache.commons.compress.utils.IOUtils;
 import org.apache.commons.lang3.StringUtils;
+
+import com.github.zafarkhaja.semver.Version;
+
 import processing.app.debug.TargetBoard;
 import processing.app.debug.TargetPackage;
 import processing.app.debug.TargetPlatform;
@@ -52,6 +55,7 @@ import processing.app.legacy.PApplet;
 import processing.app.macosx.ThinkDifferent;
 import processing.app.packages.LibraryList;
 import processing.app.packages.UserLibrary;
+import processing.app.packages.UserLibraryFolder.Location;
 import processing.app.syntax.PdeKeywords;
 import processing.app.syntax.SketchTextAreaDefaultInputMap;
 import processing.app.tools.MenuScroller;
@@ -70,6 +74,7 @@ import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import static processing.app.I18n.format;
 import static processing.app.I18n.tr;
 
 
@@ -209,6 +214,20 @@ public class Base {
     parser.parseArgumentsPhase1();
     commandLine = !parser.isGuiMode();
 
+    BaseNoGui.checkInstallationFolder();
+
+    // If no path is set, get the default sketchbook folder for this platform
+    if (BaseNoGui.getSketchbookPath() == null) {
+      File defaultFolder = getDefaultSketchbookFolderOrPromptForIt();
+      if (BaseNoGui.getPortableFolder() != null)
+        PreferencesData.set("sketchbook.path", BaseNoGui.getPortableSketchbookFolder());
+      else
+        PreferencesData.set("sketchbook.path", defaultFolder.getAbsolutePath());
+      if (!defaultFolder.exists()) {
+        defaultFolder.mkdirs();
+      }
+    }
+
     SplashScreenHelper splash;
     if (parser.isGuiMode()) {
       // Setup all notification widgets
@@ -242,20 +261,6 @@ public class Base {
     // Create a location for untitled sketches
     untitledFolder = FileUtils.createTempFolder("untitled" + new Random().nextInt(Integer.MAX_VALUE), ".tmp");
     DeleteFilesOnShutdown.add(untitledFolder);
-
-    BaseNoGui.checkInstallationFolder();
-
-    // If no path is set, get the default sketchbook folder for this platform
-    if (BaseNoGui.getSketchbookPath() == null) {
-      File defaultFolder = getDefaultSketchbookFolderOrPromptForIt();
-      if (BaseNoGui.getPortableFolder() != null)
-        PreferencesData.set("sketchbook.path", BaseNoGui.getPortableSketchbookFolder());
-      else
-        PreferencesData.set("sketchbook.path", defaultFolder.getAbsolutePath());
-      if (!defaultFolder.exists()) {
-        defaultFolder.mkdirs();
-      }
-    }
 
     splash.splashText(tr("Initializing packages..."));
     BaseNoGui.initPackages();
@@ -304,7 +309,12 @@ public class Base {
 
       ContributedPlatform selected = null;
       if (boardToInstallParts.length == 3) {
-        selected = indexer.getIndex().findPlatform(boardToInstallParts[0], boardToInstallParts[1], VersionHelper.valueOf(boardToInstallParts[2]).toString());
+        Optional<Version> version = VersionHelper.valueOf(boardToInstallParts[2]);
+        if (!version.isPresent()) {
+          System.out.println(format(tr("Invalid version {0}"), boardToInstallParts[2]));
+          System.exit(1);
+        }
+        selected = indexer.getIndex().findPlatform(boardToInstallParts[0], boardToInstallParts[1], version.get().toString());
       } else if (boardToInstallParts.length == 2) {
         List<ContributedPlatform> platformsByName = indexer.getIndex().findPlatforms(boardToInstallParts[0], boardToInstallParts[1]);
         Collections.sort(platformsByName, new DownloadableContributionVersionComparator());
@@ -319,11 +329,11 @@ public class Base {
 
       ContributedPlatform installed = indexer.getInstalled(boardToInstallParts[0], boardToInstallParts[1]);
 
-      if (!selected.isReadOnly()) {
+      if (!selected.isBuiltIn()) {
         contributionInstaller.install(selected, progressListener);
       }
 
-      if (installed != null && !installed.isReadOnly()) {
+      if (installed != null && !installed.isBuiltIn()) {
         contributionInstaller.remove(installed);
       }
 
@@ -337,15 +347,20 @@ public class Base {
 
       LibrariesIndexer indexer = new LibrariesIndexer(BaseNoGui.getSettingsFolder());
       indexer.parseIndex();
-      indexer.setSketchbookLibrariesFolder(BaseNoGui.getSketchbookLibrariesFolder());
-      indexer.setLibrariesFolders(BaseNoGui.getLibrariesPath());
+      indexer.setLibrariesFolders(BaseNoGui.getLibrariesFolders());
+      indexer.rescanLibraries();
 
       for (String library : parser.getLibraryToInstall().split(",")) {
         String[] libraryToInstallParts = library.split(":");
 
         ContributedLibrary selected = null;
         if (libraryToInstallParts.length == 2) {
-          selected = indexer.getIndex().find(libraryToInstallParts[0], VersionHelper.valueOf(libraryToInstallParts[1]).toString());
+          Optional<Version> version = VersionHelper.valueOf(libraryToInstallParts[1]);
+          if (!version.isPresent()) {
+            System.out.println(format(tr("Invalid version {0}"), libraryToInstallParts[1]));
+            System.exit(1);
+          }
+          selected = indexer.getIndex().find(libraryToInstallParts[0], version.get().toString());
         } else if (libraryToInstallParts.length == 1) {
           List<ContributedLibrary> librariesByName = indexer.getIndex().find(libraryToInstallParts[0]);
           Collections.sort(librariesByName, new DownloadableContributionVersionComparator());
@@ -358,11 +373,14 @@ public class Base {
           System.exit(1);
         }
 
-        ContributedLibrary installed = indexer.getIndex().getInstalled(libraryToInstallParts[0]);
-        if (selected.isReadOnly()) {
-          libraryInstaller.remove(installed, progressListener);
+        Optional<ContributedLibrary> mayInstalled = indexer.getIndex().getInstalled(libraryToInstallParts[0]);
+        if (mayInstalled.isPresent() && selected.isIDEBuiltIn()) {
+          System.out.println(tr(I18n
+              .format("Library {0} is available as built-in in the IDE.\nRemoving the other version {1} installed in the sketchbook...",
+                      library, mayInstalled.get().getParsedVersion())));
+          libraryInstaller.remove(mayInstalled.get(), progressListener);
         } else {
-          libraryInstaller.install(selected, installed, progressListener);
+          libraryInstaller.install(selected, mayInstalled, progressListener);
         }
       }
 
@@ -446,7 +464,7 @@ public class Base {
         if (!parser.isForceSavePrefs())
           PreferencesData.setDoSave(true);
         if (handleOpen(file, retrieveSketchLocation(".default"), false) == null) {
-          String mess = I18n.format(tr("Failed to open sketch: \"{0}\""), path);
+          String mess = format(tr("Failed to open sketch: \"{0}\""), path);
           // Open failure is fatal in upload/verify mode
           if (parser.isVerifyOrUploadMode())
             showError(null, mess, 2);
@@ -483,6 +501,9 @@ public class Base {
       System.exit(0);
     } else if (parser.isGetPrefMode()) {
       BaseNoGui.dumpPrefs(parser);
+    } else if (parser.isVersionMode()) {
+      System.out.println("Arduino: " + BaseNoGui.VERSION_NAME_LONG);
+      System.exit(0);
     }
   }
 
@@ -629,9 +650,6 @@ public class Base {
         System.err.println(e);
       }
     }
-
-    // set the current window to be the console that's getting output
-    EditorConsole.setCurrentEditorConsole(activeEditor.console);
   }
 
   protected int[] defaultEditorLocation() {
@@ -1062,9 +1080,8 @@ public class Base {
     }
   }
 
-  private List<ContributedLibrary> getSortedLibraries() {
-    List<ContributedLibrary> installedLibraries = new LinkedList<>(BaseNoGui.librariesIndexer.getInstalledLibraries());
-    Collections.sort(installedLibraries, new LibraryByTypeComparator());
+  private LibraryList getSortedLibraries() {
+    LibraryList installedLibraries = BaseNoGui.librariesIndexer.getInstalledLibraries();
     Collections.sort(installedLibraries, new LibraryOfSameTypeComparator());
     return installedLibraries;
   }
@@ -1087,6 +1104,7 @@ public class Base {
     addLibraryMenuItem.addActionListener(new ActionListener() {
       public void actionPerformed(ActionEvent e) {
         Base.this.handleAddLibrary();
+        BaseNoGui.librariesIndexer.rescanLibraries();
         Base.this.onBoardOrPortChange();
         Base.this.rebuildImportMenu(Editor.importMenu);
         Base.this.rebuildExamplesMenu(Editor.examplesMenu);
@@ -1099,15 +1117,16 @@ public class Base {
     TargetPlatform targetPlatform = BaseNoGui.getTargetPlatform();
 
     if (targetPlatform != null) {
-      List<ContributedLibrary> libs = getSortedLibraries();
+      LibraryList libs = getSortedLibraries();
       String lastLibType = null;
-      for (ContributedLibrary lib : libs) {
-        if (lastLibType == null || !lastLibType.equals(lib.getTypes().get(0))) {
+      for (UserLibrary lib : libs) {
+        String libType = lib.getTypes().get(0);
+        if (!libType.equals(lastLibType)) {
           if (lastLibType != null) {
             importMenu.addSeparator();
           }
-          lastLibType = lib.getTypes().get(0);
-          JMenuItem platformItem = new JMenuItem(I18n.format(tr("{0} libraries"), tr(lastLibType)));
+          lastLibType = libType;
+          JMenuItem platformItem = new JMenuItem(format(tr("{0} libraries"), tr(lastLibType)));
           platformItem.setEnabled(false);
           importMenu.add(platformItem);
         }
@@ -1118,7 +1137,7 @@ public class Base {
             try {
               activeEditor.getSketchController().importLibrary(l);
             } catch (IOException e) {
-              showWarning(tr("Error"), I18n.format("Unable to list header files in {0}", l.getSrcFolder()), e);
+              showWarning(tr("Error"), format("Unable to list header files in {0}", l.getSrcFolder()), e);
             }
           }
         };
@@ -1149,10 +1168,6 @@ public class Base {
     }
 
     // Libraries can come from 4 locations: collect info about all four
-    File ideLibraryPath = BaseNoGui.getContentFile("libraries");
-    File sketchbookLibraryPath = BaseNoGui.getSketchbookLibrariesFolder();
-    File platformLibraryPath = null;
-    File referencedPlatformLibraryPath = null;
     String boardId = null;
     String referencedPlatformName = null;
     String myArch = null;
@@ -1160,14 +1175,12 @@ public class Base {
     if (targetPlatform != null) {
       myArch = targetPlatform.getId();
       boardId = BaseNoGui.getTargetBoard().getName();
-      platformLibraryPath = new File(targetPlatform.getFolder(), "libraries");
       String core = BaseNoGui.getBoardPreferences().get("build.core", "arduino");
       if (core.contains(":")) {
         String refcore = core.split(":")[0];
         TargetPlatform referencedPlatform = BaseNoGui.getTargetPlatform(refcore, myArch);
         if (referencedPlatform != null) {
           referencedPlatformName = referencedPlatform.getPreferences().get("name");
-          referencedPlatformLibraryPath = new File(referencedPlatform.getFolder(), "libraries");
         }
       }
     }
@@ -1177,7 +1190,7 @@ public class Base {
     // any incompatible sketchbook libs further divided into their own list.
     // The 7th list of "other" libraries should always be empty, but serves
     // as a safety feature to prevent any library from vanishing.
-    LibraryList allLibraries = new LibraryList(BaseNoGui.librariesIndexer.getInstalledLibraries());
+    LibraryList allLibraries = BaseNoGui.librariesIndexer.getInstalledLibraries();
     LibraryList ideLibs = new LibraryList();
     LibraryList retiredIdeLibs = new LibraryList();
     LibraryList platformLibs = new LibraryList();
@@ -1187,7 +1200,7 @@ public class Base {
     LibraryList otherLibs = new LibraryList();
     for (UserLibrary lib : allLibraries) {
       // Get the library's location - used for sorting into categories
-      File libraryLocation = lib.getInstalledFolder().getParentFile();
+      Location location = lib.getLocation();
       // Is this library compatible?
       List<String> arch = lib.getArchitectures();
       boolean compatible;
@@ -1197,31 +1210,28 @@ public class Base {
         compatible = arch.contains(myArch);
       }
       // IDE Libaries (including retired)
-      if (libraryLocation.equals(ideLibraryPath)) {
+      if (location == Location.IDE_BUILTIN) {
         if (compatible) {
           // only compatible IDE libs are shown
-          boolean retired = false;
-          List<String> types = lib.getTypes();
-          if (types != null) retired = types.contains("Retired");
-          if (retired) {
+          if (lib.getTypes().contains("Retired")) {
             retiredIdeLibs.add(lib);
           } else {
             ideLibs.add(lib);
           }
         }
       // Platform Libraries
-      } else if (libraryLocation.equals(platformLibraryPath)) {
+      } else if (location == Location.CORE) {
         // all platform libs are assumed to be compatible
         platformLibs.add(lib);
       // Referenced Platform Libraries
-      } else if (libraryLocation.equals(referencedPlatformLibraryPath)) {
+      } else if (location == Location.REFERENCED_CORE) {
         // all referenced platform libs are assumed to be compatible
         referencedPlatformLibs.add(lib);
       // Sketchbook Libraries (including incompatible)
-      } else if (libraryLocation.equals(sketchbookLibraryPath)) {
+      } else if (location == Location.SKETCHBOOK) {
         if (compatible) {
           // libraries promoted from sketchbook (behave as builtin)
-          if (lib.getTypes() != null && lib.getTypes().contains("Arduino")
+          if (!lib.getTypes().isEmpty() && lib.getTypes().contains("Arduino")
               && lib.getArchitectures().contains("*")) {
             ideLibs.add(lib);
           } else {
@@ -1259,7 +1269,7 @@ public class Base {
     if (!platformLibs.isEmpty()) {
       menu.addSeparator();
       platformLibs.sort();
-      label = new JMenuItem(I18n.format(tr("Examples for {0}"), boardId));
+      label = new JMenuItem(format(tr("Examples for {0}"), boardId));
       label.setEnabled(false);
       menu.add(label);
       for (UserLibrary lib : platformLibs) {
@@ -1270,7 +1280,7 @@ public class Base {
     if (!referencedPlatformLibs.isEmpty()) {
       menu.addSeparator();
       referencedPlatformLibs.sort();
-      label = new JMenuItem(I18n.format(tr("Examples for {0}"), referencedPlatformName));
+      label = new JMenuItem(format(tr("Examples for {0}"), referencedPlatformName));
       label.setEnabled(false);
       menu.add(label);
       for (UserLibrary lib : referencedPlatformLibs) {
@@ -1436,7 +1446,7 @@ public class Base {
     boardMenu.add(new JSeparator());
 
     // Generate custom menus for all platforms
-    Set<String> customMenusTitles = new HashSet<>();
+    Set<String> customMenusTitles = new LinkedHashSet<>();
     for (TargetPackage targetPackage : BaseNoGui.packages.values()) {
       for (TargetPlatform targetPlatform : targetPackage.platforms()) {
         customMenusTitles.addAll(targetPlatform.getCustomMenus().values());
@@ -1788,7 +1798,7 @@ public class Base {
           try {
             activeEditor.getSketchController().importLibrary(l);
           } catch (IOException e) {
-            showWarning(tr("Error"), I18n.format("Unable to list header files in {0}", l.getSrcFolder()), e);
+            showWarning(tr("Error"), format("Unable to list header files in {0}", l.getSrcFolder()), e);
           }
         }
       };
@@ -1877,11 +1887,6 @@ public class Base {
     getEditors().forEach(Editor::applyPreferences);
   }
 
-  // XXX: Remove this method and make librariesIndexer non-static
-  static public LibraryList getLibraries() {
-    return BaseNoGui.librariesIndexer.getInstalledLibraries();
-  }
-
   public List<JMenu> getBoardsCustomMenus() {
     return boardsCustomMenus;
   }
@@ -1943,10 +1948,9 @@ public class Base {
   static public void openURL(String url) {
     try {
       BaseNoGui.getPlatform().openURL(url);
-
     } catch (Exception e) {
       showWarning(tr("Problem Opening URL"),
-              I18n.format(tr("Could not open the URL\n{0}"), url), e);
+                  format(tr("Could not open the URL\n{0}"), url), e);
     }
   }
 
@@ -1968,10 +1972,9 @@ public class Base {
   static public void openFolder(File file) {
     try {
       BaseNoGui.getPlatform().openFolder(file);
-
     } catch (Exception e) {
       showWarning(tr("Problem Opening Folder"),
-              I18n.format(tr("Could not open the folder\n{0}"), file.getAbsolutePath()), e);
+                  format(tr("Could not open the folder\n{0}"), file.getAbsolutePath()), e);
     }
   }
 
@@ -2049,7 +2052,7 @@ public class Base {
     if(referenceFile.exists()){
       openURL(referenceFile.getAbsolutePath());
     }else{
-      showWarning(tr("Problem Opening URL"), I18n.format(tr("Could not open the URL\n{0}"), referenceFile), null);
+      showWarning(tr("Problem Opening URL"), format(tr("Could not open the URL\n{0}"), referenceFile), null);
     }
   }
 
@@ -2305,7 +2308,7 @@ public class Base {
 
       String libName = libFolder.getName();
       if (!BaseNoGui.isSanitaryName(libName)) {
-        String mess = I18n.format(tr("The library \"{0}\" cannot be used.\n"
+        String mess = format(tr("The library \"{0}\" cannot be used.\n"
                         + "Library names must contain only basic letters and numbers.\n"
                         + "(ASCII only and no spaces, and it cannot start with a number)"),
                 libName);
@@ -2314,8 +2317,10 @@ public class Base {
       }
 
       String[] headers;
-      if (new File(libFolder, "library.properties").exists()) {
-        headers = BaseNoGui.headerListFromIncludePath(UserLibrary.create(libFolder).getSrcFolder());
+      File libProp = new File(libFolder, "library.properties");
+      File srcFolder = new File(libFolder, "src");
+      if (libProp.exists() && srcFolder.isDirectory()) {
+        headers = BaseNoGui.headerListFromIncludePath(srcFolder);
       } else {
         headers = BaseNoGui.headerListFromIncludePath(libFolder);
       }
@@ -2325,9 +2330,9 @@ public class Base {
       }
 
       // copy folder
-      File destinationFolder = new File(BaseNoGui.getSketchbookLibrariesFolder(), sourceFile.getName());
+      File destinationFolder = new File(BaseNoGui.getSketchbookLibrariesFolder().folder, sourceFile.getName());
       if (!destinationFolder.mkdir()) {
-        activeEditor.statusError(I18n.format(tr("A library named {0} already exists"), sourceFile.getName()));
+        activeEditor.statusError(format(tr("A library named {0} already exists"), sourceFile.getName()));
         return;
       }
       try {
